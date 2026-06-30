@@ -1,0 +1,550 @@
+---
+title: "NBA Salary Predictor — 2025-26"
+author: "Krishna Rao | Energy Lasts Forever"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+---
+
+# Overview
+
+This pipeline scrapes Basketball Reference, builds a **Bayesian linear regression**
+model to predict what each player *should* earn based on their on-court production,
+and compares predicted salaries to actual contracts and free agent signings.
+
+**Output:** an Excel file with three tabs — All Contracts, FA Unsigned, FA Signed.
+
+---
+
+# Step 0 — Packages
+
+```{r packages}
+# Uncomment to install on first run:
+# install.packages(c("rvest","httr","dplyr","tidyr","stringr","tibble",
+#                    "rstanarm","posterior","bayesplot","ggplot2","scales",
+#                    "knitr","kableExtra","writexl"))
+
+library(rvest)
+library(httr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(rstanarm)
+library(posterior)
+library(bayesplot)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(writexl)
+```
+
+---
+
+# Step 1 — Configuration
+
+> **Only edit this chunk between seasons.**
+
+```{r config}
+# ── Season ────────────────────────────────────────────────────────────────────
+SEASON_YEAR <- 2026
+
+# ── Salary column ─────────────────────────────────────────────────────────────
+# Must match the column name on the bball-ref contracts page exactly.
+SALARY_COL  <- "2025-26"
+
+# ── GitHub raw URL for the FA list CSV ────────────────────────────────────────
+FA_CSV_URL <- "https://raw.githubusercontent.com/KrishnaRao1/salary_predictor/refs/heads/main/nba_2026_free_agents.csv"
+
+# ── Features ──────────────────────────────────────────────────────────────────
+# Stats the model uses to predict salary. Names must match bball-ref headers.
+#
+#   3P%  — three-point shooting efficiency
+#   TS%  — true shooting % (overall scoring efficiency)
+#   USG% — usage rate (how often the player has the ball)
+#   VORP — value over replacement player
+#   DWS  — defensive win shares
+#   DBPM — defensive box plus/minus
+#   AST% — assist percentage
+#   TRB  — total rebounds per game
+#   STL  — steals per game
+#   BLK  — blocks per game
+FEATURES <- c("3P%", "TS%", "USG%", "VORP", "DWS", "DBPM", "AST%", "TRB", "STL", "BLK")
+
+# ── Model settings ─────────────────────────────────────────────────────────────
+CHAINS  <- 4
+ITER    <- 3000
+WARMUP  <- 1000
+SEED    <- 42
+
+# ── Output ─────────────────────────────────────────────────────────────────────
+OUTPUT_FILE <- paste0("NBA_Salary_Predictor_", SEASON_YEAR, ".xlsx")
+```
+
+---
+
+# Step 2 — Helper Functions
+
+```{r helpers}
+# ── bref_table ────────────────────────────────────────────────────────────────
+# Fetches any bball-ref HTML table by its CSS id.
+# multi_header = TRUE flattens tables with a two-row header (e.g. contracts).
+# Fixes:
+#   1. make.unique() — prevents "duplicate names" error in dplyr::filter()
+#   2. Guarantees a column named "Player" exists
+bref_table <- function(url, table_id, multi_header = FALSE) {
+  Sys.sleep(4)
+  page <- GET(url, user_agent("Mozilla/5.0 (compatible; R/rvest scraper)"))
+  html <- read_html(content(page, as = "text"))
+  node <- html %>% html_element(paste0("#", table_id))
+  tbl  <- node %>% html_table(header = TRUE)
+
+  if (multi_header) {
+    colnames(tbl) <- as.character(unlist(tbl[1, ]))
+    tbl <- tbl[-1, ]
+  }
+
+  colnames(tbl) <- make.unique(colnames(tbl), sep = "_")
+  if (!"Player" %in% colnames(tbl)) colnames(tbl)[1] <- "Player"
+
+  tbl
+}
+
+# ── drop_junk_cols ────────────────────────────────────────────────────────────
+# Removes blank ("") or auto-numbered ("_1", "_2") columns left by rvest.
+# Must run before filter() to prevent the "duplicate names" dplyr error.
+drop_junk_cols <- function(df) {
+  df[, !grepl("^(_\\d+)?$", colnames(df)), drop = FALSE]
+}
+
+# ── clean_name ────────────────────────────────────────────────────────────────
+# Strips asterisks, daggers, and extra whitespace from player name strings.
+# Applied to every player column before every join.
+clean_name <- function(x) {
+  x %>% str_trim() %>% str_remove_all("[\\*†]") %>% str_squish()
+}
+
+# ── scale_features ────────────────────────────────────────────────────────────
+# Z-score standardisation. Uses X_means and X_sds set in the standardise chunk.
+# Defined here so it is available in both the training and FA prediction steps.
+scale_features <- function(df) {
+  mat <- as.matrix(df %>% select(all_of(FEATURES)))
+  sweep(sweep(mat, 2, X_means, "-"), 2, X_sds, "/")
+}
+```
+
+---
+
+# Step 3 — Load 2026 Free Agent List from GitHub
+
+The NBA FA tracker page is JavaScript-rendered and cannot be scraped with `rvest`.
+The full list (213 players, sourced from `nba.com/players/free-agent-tracker/2026`)
+is stored as a CSV in the project GitHub repo and loaded here.
+
+**To update next offseason:** replace the CSV on GitHub with the new FA list.
+
+```{r load-fa-list, cache=TRUE}
+fa_all <- read.csv(FA_CSV_URL, stringsAsFactors = FALSE) %>%
+  mutate(Player = clean_name(Player))
+
+cat(sprintf("Free agents loaded from GitHub: %d\n", nrow(fa_all)))
+print(head(fa_all, 5))
+```
+
+---
+
+# Step 4 — Signed FA Contracts
+
+Players who have already signed are listed here with their actual new AAV ($M).
+**To update:** add rows as players sign. All other FAs remain as "Unsigned"
+and get a model-predicted salary only.
+
+```{r signed-contracts}
+fa_signed <- tribble(
+  ~Player,              ~Actual_New_AAV,
+  "Trae Young",                   53.2,
+  "Austin Reaves",                46.2,
+  "Ayo Dosunmu",                  22.4,
+  "Coby White",                   24.7,
+  "Collin Gillespie",             12.0,
+  "Mark Williams",                12.7,
+  "Jordan Goodwin",                6.3,
+  "Jose Alvarado",                 4.9,
+  "Al Horford",                    7.0,
+  "Mohamed Diawara",               2.5
+) %>%
+  mutate(Player = clean_name(Player))
+
+# Attach signed status to the full FA list
+fa_all <- fa_all %>%
+  left_join(fa_signed, by = "Player") %>%
+  mutate(Status = ifelse(is.na(Actual_New_AAV), "Unsigned", "Signed"))
+
+cat(sprintf("Signed:   %d\n", sum(fa_all$Status == "Signed")))
+cat(sprintf("Unsigned: %d\n", sum(fa_all$Status == "Unsigned")))
+```
+
+---
+
+# Step 5 — Scrape Stats & Contracts from Basketball Reference
+
+```{r scrape-data, cache=TRUE, cache.extra=SEASON_YEAR}
+# cache.extra=SEASON_YEAR forces a cache bust when the year changes, so
+# stale data from a prior season is never silently reused.
+
+cat("Fetching per-game stats...\n")
+basic_raw <- bref_table(
+  paste0("https://www.basketball-reference.com/leagues/NBA_", SEASON_YEAR, "_per_game.html"),
+  "per_game_stats"
+)
+
+cat("Fetching advanced stats...\n")
+adv_raw <- bref_table(
+  paste0("https://www.basketball-reference.com/leagues/NBA_", SEASON_YEAR, "_advanced.html"),
+  "advanced"
+)
+
+cat("Fetching contract data...\n")
+money_raw <- bref_table(
+  "https://www.basketball-reference.com/contracts/players.html",
+  "player-contracts",
+  multi_header = TRUE
+)
+
+cat("Done.\n")
+```
+
+---
+
+# Step 6 — Clean & Merge
+
+```{r clean-and-merge}
+# ── Per-game ──────────────────────────────────────────────────────────────────
+basic_df <- basic_raw %>%
+  drop_junk_cols() %>%
+  filter(Player != "Player") %>%
+  mutate(Player = clean_name(Player)) %>%
+  select(-any_of(c("G","GS","ORB","DRB","PF","Awards",
+                   "FT","FTA","FG","FGA","FG%","Rk"))) %>%
+  distinct(Player, .keep_all = TRUE)
+
+# ── Advanced ──────────────────────────────────────────────────────────────────
+adv_df <- adv_raw %>%
+  drop_junk_cols() %>%
+  filter(Player != "Player") %>%
+  mutate(Player = clean_name(Player)) %>%
+  select(-any_of(c("Age","Team","Pos","G","GS","MP","PER","Awards","Rk"))) %>%
+  distinct(Player, .keep_all = TRUE)
+
+# ── Contracts ─────────────────────────────────────────────────────────────────
+money_df <- money_raw %>%
+  drop_junk_cols() %>%
+  filter(Player != "Player") %>%
+  mutate(Player = clean_name(Player)) %>%
+  select(-any_of(c("Tm","2024-25","2027-28","2028-29","2029-30","Rk"))) %>%
+  distinct(Player, .keep_all = TRUE)
+
+# ── Merge stats + contracts ───────────────────────────────────────────────────
+combined_df <- basic_df %>%
+  inner_join(adv_df,   by = "Player") %>%
+  inner_join(money_df, by = "Player") %>%
+  mutate(
+    salary_clean = as.numeric(gsub("[$,]", "", .data[[SALARY_COL]])) / 1e6
+  ) %>%
+  mutate(across(all_of(FEATURES), ~ suppressWarnings(as.numeric(.))))
+
+cat(sprintf("Players in combined dataset: %d\n", nrow(combined_df)))
+```
+
+```{r preview-merge, echo=FALSE}
+combined_df %>%
+  select(Player, any_of(c("Pos","Age","MP","TS%","USG%","VORP","BPM", SALARY_COL))) %>%
+  head(8) %>%
+  kable(caption = "Sample of merged dataset") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+---
+
+# Step 7 — Split: Under Contract vs Free Agents
+
+- **`df_model`** — players with a known `r SALARY_COL` salary. Used to train the model.
+- **`fa_df`** — all 2026 FAs whose 2025-26 stats are available.
+
+```{r split}
+df_model <- combined_df %>%
+  filter(!is.na(salary_clean)) %>%
+  drop_na(all_of(FEATURES))
+
+fa_df <- fa_all %>%
+  inner_join(combined_df, by = "Player") %>%
+  drop_na(all_of(FEATURES))
+
+cat(sprintf("Under contract (training set):   %d players\n", nrow(df_model)))
+cat(sprintf("FAs matched to stats — signed:   %d\n", sum(fa_df$Status == "Signed")))
+cat(sprintf("FAs matched to stats — unsigned: %d\n", sum(fa_df$Status == "Unsigned")))
+```
+
+---
+
+# Step 8 — Standardise Features
+
+Every feature is z-score standardised (subtract mean, divide by SD). Parameters
+are computed from the training set only and reapplied to the FA set in Step 10.
+
+```{r standardise}
+X_train <- df_model %>% select(all_of(FEATURES))
+X_means <- colMeans(X_train)
+X_sds   <- apply(X_train, 2, sd)
+
+X_scaled <- scale_features(df_model)
+y_train  <- df_model$salary_clean
+
+train_data           <- as.data.frame(X_scaled)
+colnames(train_data) <- FEATURES
+train_data$salary    <- y_train
+```
+
+```{r feature-dist, echo=FALSE, fig.height=4, fig.cap="After standardisation every feature should be centered near 0."}
+as.data.frame(X_scaled) %>%
+  setNames(FEATURES) %>%
+  pivot_longer(everything(), names_to = "Feature", values_to = "z") %>%
+  ggplot(aes(x = z, fill = Feature)) +
+  geom_density(alpha = 0.4, show.legend = FALSE) +
+  facet_wrap(~ Feature, scales = "free_y", ncol = 5) +
+  theme_minimal() +
+  labs(title = "Standardised feature distributions", x = "z-score", y = NULL)
+```
+
+---
+
+# Step 9 — Bayesian Linear Regression
+
+Each feature gets a weight (`beta`). Predicted salary = weighted sum of
+standardised stats + intercept.
+
+| Parameter | Prior | Meaning |
+|-----------|-------|---------|
+| `beta` | Normal(0, 1) | No strong belief any one stat dominates |
+| `intercept` | Normal(0, 5) | Average salary can be anywhere in a wide range |
+| `sigma` | Exponential(1) | Predictions are not perfect |
+
+```{r fit-model, results='hide', cache=TRUE}
+# Backtick-wrap feature names to handle % and spaces in column names.
+# Stan internally mangles these (e.g. "3P%" -> "3P.") so feature_pars
+# uses grep() on dimnames() rather than referencing FEATURES directly.
+model_formula <- as.formula(
+  paste("salary ~", paste(paste0("`", FEATURES, "`"), collapse = " + "))
+)
+
+bayes_model <- stan_glm(
+  formula         = model_formula,
+  data            = train_data,
+  family          = gaussian(),
+  prior           = normal(location = 0, scale = 1, autoscale = FALSE),
+  prior_intercept = normal(location = 0, scale = 5, autoscale = FALSE),
+  prior_aux       = exponential(rate = 1, autoscale = FALSE),
+  chains          = CHAINS,
+  iter            = ITER,
+  warmup          = WARMUP,
+  seed            = SEED,
+  refresh         = 0
+)
+```
+
+```{r model-summary, echo=FALSE}
+as.data.frame(summary(bayes_model)) %>%
+  tibble::rownames_to_column("Parameter") %>%
+  filter(Parameter != "log-posterior") %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  kable(caption = "Posterior summary — mean, SD, and credible intervals") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+```{r coef-plot, echo=FALSE, fig.height=5, fig.cap="Bars that don't cross zero have the strongest relationship to salary."}
+posterior_draws <- as.array(bayes_model)
+feature_pars    <- grep("Intercept|sigma",
+                        dimnames(posterior_draws)$parameters,
+                        invert = TRUE, value = TRUE)
+
+mcmc_intervals(posterior_draws, pars = feature_pars, prob = 0.80, prob_outer = 0.95) +
+  labs(title = "Feature coefficients (80% and 95% credible intervals)",
+       x     = "Effect on predicted salary ($M, standardised features)")
+```
+
+```{r trace-plot, echo=FALSE, fig.height=6, fig.cap="Fuzzy caterpillars = good mixing. Trends or drifts = model needs more iterations."}
+posterior_draws <- as.array(bayes_model)
+feature_pars    <- grep("Intercept|sigma",
+                        dimnames(posterior_draws)$parameters,
+                        invert = TRUE, value = TRUE)
+
+mcmc_trace(posterior_draws,
+           pars = c("(Intercept)", feature_pars[1:4], "sigma")) +
+  labs(title = "MCMC trace plots — intercept, first 4 features, sigma")
+```
+
+---
+
+# Step 10 — Predict: All Under-Contract Players
+
+`Gap` = predicted minus actual. Positive = undervalued. Negative = overvalued.
+95% CI lower bound is floored at $0M.
+
+```{r predict-known}
+pp_known <- posterior_predict(bayes_model, newdata = train_data)
+
+df_model <- df_model %>%
+  mutate(
+    Predicted_Salary = round(colMeans(pp_known), 1),
+    Pred_Lower_95    = pmax(round(apply(pp_known, 2, quantile, probs = 0.025), 1), 0),
+    Pred_Upper_95    = round(apply(pp_known, 2, quantile, probs = 0.975), 1),
+    Gap              = round(Predicted_Salary - salary_clean, 1)
+  )
+```
+
+```{r table-all-contracts, echo=FALSE}
+df_model %>%
+  arrange(desc(Gap)) %>%
+  mutate(across(where(is.numeric), ~ round(., 1))) %>%
+  select(Player,
+         `Actual ($M)`    = salary_clean,
+         `Predicted ($M)` = Predicted_Salary,
+         `95% CI Low`     = Pred_Lower_95,
+         `95% CI High`    = Pred_Upper_95,
+         `Gap ($M)`       = Gap) %>%
+  kable(caption = "All Under-Contract Players — Predicted vs Actual Salary") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+# Step 11 — Predict: 2026 Free Agents (Signed + Unsigned)
+
+95% CI lower bound is floored at $0M.
+
+```{r predict-fa}
+X_fa_scaled       <- scale_features(fa_df)
+fa_data           <- as.data.frame(X_fa_scaled)
+colnames(fa_data) <- FEATURES
+
+pp_fa <- posterior_predict(bayes_model, newdata = fa_data)
+
+fa_df <- fa_df %>%
+  mutate(
+    Predicted_AAV = round(colMeans(pp_fa), 1),
+    Pred_Lower_95 = pmax(round(apply(pp_fa, 2, quantile, probs = 0.025), 1), 0),
+    Pred_Upper_95 = round(apply(pp_fa, 2, quantile, probs = 0.975), 1),
+    Gap           = round(Predicted_AAV - Actual_New_AAV, 1)
+  )
+```
+
+### Signed Free Agents — Predicted vs Actual New AAV
+
+```{r table-fa-signed, echo=FALSE}
+fa_df %>%
+  filter(Status == "Signed") %>%
+  arrange(desc(Predicted_AAV)) %>%
+  select(Player,
+         `FA Type`             = FA_Type,
+         `Actual New AAV ($M)` = Actual_New_AAV,
+         `Predicted AAV ($M)`  = Predicted_AAV,
+         `95% CI Low`          = Pred_Lower_95,
+         `95% CI High`         = Pred_Upper_95,
+         `Gap ($M)`            = Gap) %>%
+  kable(caption = "Signed 2026 Free Agents — Predicted vs Actual New AAV") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+### Unsigned Free Agents — Predicted AAV
+
+```{r table-fa-unsigned, echo=FALSE}
+fa_df %>%
+  filter(Status == "Unsigned") %>%
+  arrange(desc(Predicted_AAV)) %>%
+  select(Player,
+         `FA Type`            = FA_Type,
+         `Predicted AAV ($M)` = Predicted_AAV,
+         `95% CI Low`         = Pred_Lower_95,
+         `95% CI High`        = Pred_Upper_95) %>%
+  kable(caption = "Unsigned 2026 Free Agents — Model Predicted AAV") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+> **To update as players sign:** add a row to the `fa_signed` tribble in Step 4
+> with the player name and AAV, then re-knit.
+
+---
+
+# Step 12 — Export to Excel
+
+Three tabs: All Contracts, FA Unsigned, FA Signed.
+
+```{r export}
+all_contracts <- df_model %>%
+  arrange(desc(Gap)) %>%
+  mutate(across(where(is.numeric), ~ round(., 1))) %>%
+  select(Player,
+         `Actual ($M)`    = salary_clean,
+         `Predicted ($M)` = Predicted_Salary,
+         `95% CI Low`     = Pred_Lower_95,
+         `95% CI High`    = Pred_Upper_95,
+         `Gap ($M)`       = Gap)
+
+fa_signed_full <- fa_df %>%
+  filter(Status == "Signed") %>%
+  arrange(desc(Predicted_AAV)) %>%
+  select(Player,
+         `FA Type`             = FA_Type,
+         `Actual New AAV ($M)` = Actual_New_AAV,
+         `Predicted AAV ($M)`  = Predicted_AAV,
+         `95% CI Low`          = Pred_Lower_95,
+         `95% CI High`         = Pred_Upper_95,
+         `Gap ($M)`            = Gap)
+
+fa_unsigned_full <- fa_df %>%
+  filter(Status == "Unsigned") %>%
+  arrange(desc(Predicted_AAV)) %>%
+  select(Player,
+         `FA Type`            = FA_Type,
+         `Predicted AAV ($M)` = Predicted_AAV,
+         `95% CI Low`         = Pred_Lower_95,
+         `95% CI High`        = Pred_Upper_95)
+
+desktop_path <- file.path(path.expand("~"), "Desktop", OUTPUT_FILE)
+
+sheets <- list(
+  All_Contracts = as.data.frame(all_contracts),
+  FA_Unsigned   = as.data.frame(fa_unsigned_full),
+  FA_Signed     = as.data.frame(fa_signed_full)
+)
+
+write_xlsx(sheets, path = desktop_path)
+cat(sprintf("Saved to Desktop: %s\n", desktop_path))
+cat(sprintf("  All_Contracts: %d rows\n", nrow(sheets$All_Contracts)))
+cat(sprintf("  FA_Unsigned:   %d rows\n", nrow(sheets$FA_Unsigned)))
+cat(sprintf("  FA_Signed:     %d rows\n", nrow(sheets$FA_Signed)))
+```
+
+---
+
+# Session Info
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
